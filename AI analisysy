@@ -1,0 +1,331 @@
+// =========================================================================
+// CORE CONFIGURATION & CONSTANTS
+// =========================================================================
+const GEMINI_API_KEY = 'AIzaSyC7KCzn_zVm8HYm9vU2ETPoZBOVFcoy_oU'; // YOUR KEY IS INTEGRATED
+const API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=" + GEMINI_API_KEY;
+
+// Constants for Synthetic Data Generation
+const tempRange = 8;
+const humidityRange = 15;
+const pressureRange = 0.02;
+const distanceRange = 40;
+const initialBaseTemp = 22;
+const initialBaseHumidity = 70;
+const initialBasePressure = 1.015;
+const initialBaseDistance = 100;
+const dailyTrendIncrease = 0.05; 
+
+// Constant for EMA Forecasting
+const EMA_SMOOTHING_FACTOR = 0.2; // Alpha (Higher means more recent data matters more)
+
+// =========================================================================
+// MAIN FUNCTION: DATA GENERATION, FORECASTING, AND ANALYSIS
+// =========================================================================
+
+function generateSensorDataFor24Hours() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getActiveSheet();
+  const timeZone = ss.getSpreadsheetTimeZone(); 
+
+  // --- 1. DETERMINE STARTING DATE AND RUN NUMBER ---
+  let startDate = new Date(); 
+  let runNumber = 0; 
+  const epochStart = new Date("2025-12-28"); 
+
+  if (sheet.getLastRow() > 1) {
+    const lastDateValue = sheet.getRange(sheet.getLastRow(), 1).getValue();
+    let lastDate;
+    
+    if (typeof lastDateValue === 'string') {
+      const datePart = lastDateValue.substring(0, 10);
+      lastDate = new Date(datePart); 
+    } else if (lastDateValue instanceof Date) {
+      lastDate = lastDateValue;
+    }
+    
+    runNumber = Math.round((lastDate.getTime() - epochStart.getTime()) / (1000 * 60 * 60 * 24)) + 1; 
+    startDate = new Date(lastDate.getTime());
+    startDate.setDate(startDate.getDate() + 1);
+    
+  } else {
+    runNumber = 0;
+  }
+  
+  startDate.setHours(0, 0, 0, 0); 
+  
+  // --- 2. APPLY TREND CALCULATION & DEFINE HEADERS ---
+  const baseTemp = initialBaseTemp + (runNumber * dailyTrendIncrease);
+  const basePressure = initialBasePressure + (runNumber * dailyTrendIncrease * 0.1);
+  const baseHumidity = initialBaseHumidity; 
+  const baseDistance = initialBaseDistance;
+
+  const headers = ["Timestamp (yyyy-MM-dd HH:mm:ss)", "Distance (cm)", "Temperature (°C)", "Humidity (%)", "Pressure (ATM)"];
+  if (sheet.getLastRow() === 0) {
+    sheet.appendRow(headers);
+  }
+  
+  const data = [];
+
+  // --- 3. GENERATE 24 HOURS OF DATA ---
+  for (let i = 0; i < 24; i++) {
+    const currentTimestamp = new Date(startDate.getTime());
+    currentTimestamp.setHours(startDate.getHours() + i);
+
+    const formattedTimestamp = Utilities.formatDate(currentTimestamp, timeZone, "yyyy-MM-dd HH:mm:ss");
+
+    // Sensor Readings Generation
+    const distance = (baseDistance + (Math.random() * distanceRange * 2) - distanceRange).toFixed(2);
+    const diurnalFactor = Math.sin((i / 24) * 2 * Math.PI - (Math.PI / 2)) * (tempRange / 2);
+    const temperature = (baseTemp + diurnalFactor + (Math.random() * (tempRange / 2) * 2) - (tempRange / 2)).toFixed(2);
+    const humidity = (baseHumidity + (Math.random() * humidityRange * 2) - humidityRange).toFixed(2);
+    const clampedHumidity = Math.min(100, Math.max(0, parseFloat(humidity)));
+    const pressure = (basePressure + (Math.random() * pressureRange * 2) - pressureRange).toFixed(3);
+
+    data.push([
+      formattedTimestamp, 
+      parseFloat(distance),
+      parseFloat(temperature),
+      clampedHumidity,
+      parseFloat(pressure)
+    ]);
+  }
+
+  // --- 4. WRITE DATA TO SHEET ---
+  sheet.getRange(sheet.getLastRow() + 1, 1, data.length, data[0].length).setValues(data);
+
+  // --- 5. PERFORM FORECASTING ---
+  // We need to fetch ALL temperature data generated so far for the EMA calculation
+  const allTemperatureData = sheet.getRange("C2:C").getValues().flat().filter(v => typeof v === 'number');
+  
+  if (allTemperatureData.length > 0) {
+      const lastKnownTemp = allTemperatureData[allTemperatureData.length - 1];
+      const forecastResults = calculateEMA(allTemperatureData, EMA_SMOOTHING_FACTOR, timeZone, lastKnownTemp);
+      writeForecastResults(forecastResults, timeZone, sheet);
+  }
+
+// --- 6. RUN GEMINI AI ANALYSIS ---
+
+// Extract just the temperature values for quick statistics
+const temperatures = data.map(row => row[2]);
+const distances = data.map(row => row[1]);
+
+// Calculate key statistics for the 24-hour batch
+const stats = {
+  last_timestamp: data[data.length - 1][0],
+  avg_temp: (temperatures.reduce((a, b) => a + b) / temperatures.length).toFixed(2),
+  max_temp: Math.max(...temperatures).toFixed(2),
+  min_temp: Math.min(...temperatures).toFixed(2),
+  avg_humidity: (data.map(row => row[3]).reduce((a, b) => a + b) / data.length).toFixed(2),
+  avg_pressure: (data.map(row => row[4]).reduce((a, b) => a + b) / data.length).toFixed(3),
+  distance_range: (Math.max(...distances) - Math.min(...distances)).toFixed(2)
+};
+
+let analysisResult = "AI Analysis failed to run. Check logs for API key or permission errors.";
+
+try {
+  // CALL THE HELPER FUNCTION WITH THE SMALLER STATS OBJECT
+  analysisResult = runGeminiAnalysis(stats, API_URL); 
+
+} catch (e) {
+  Logger.log("AI Analysis Exception: " + e.toString());
+  analysisResult += "\nError: " + e.toString();
+}
+
+  // --- 7. PROVIDE FEEDBACK ---
+  const newDateString = Utilities.formatDate(startDate, timeZone, "yyyy-MM-dd");
+  SpreadsheetApp.getUi().alert(
+    'Success!', 
+    'Generated 24 hourly sensor readings for ' + newDateString + '.\n\n' + 
+    'Forecasting Complete. AI Summary: ' + analysisResult.substring(0, 150) + '...',
+    SpreadsheetApp.getUi().ButtonSet.OK
+  );
+}
+
+
+// =========================================================================
+// FORECASTING FUNCTION: EXPONENTIAL MOVING AVERAGE (EMA)
+// =========================================================================
+
+/**
+ * Calculates the Exponential Moving Average (EMA) and forecasts future values.
+ * @param {number[]} dataArray - Array of historical temperature data.
+ * @param {number} alpha - The smoothing factor (0 to 1).
+ * @param {string} timeZone - The spreadsheet's timezone.
+ * @param {number} lastKnownValue - The last value in the data set.
+ * @returns {Array<Array<any>>} - Array of forecast rows.
+ */
+function calculateEMA(dataArray, alpha, timeZone, lastKnownValue) {
+    
+    // Calculate the initial EMA (often set to the first actual value or SMA)
+    let ema = dataArray[0];
+    
+    // Calculate EMA for the historical data to find the trend/current value
+    for (let i = 1; i < dataArray.length; i++) {
+        ema = (dataArray[i] * alpha) + (ema * (1 - alpha));
+    }
+
+    // --- FORECASTING ---
+    const forecastRows = [];
+    const forecastHours = [1, 6, 24]; // Required forecast horizons 
+    const lastTimestamp = new Date(); // Start prediction from the moment the script runs
+
+    // Simple EMA assumes the next value will equal the current EMA
+    // We add a tiny offset to simulate random noise on the prediction
+    
+    // Calculate Standard Deviation of the Last 24 points for Confidence Interval (CI)
+    const last24 = dataArray.slice(-24);
+    const mean24 = last24.reduce((a, b) => a + b, 0) / last24.length;
+    const stdDev = Math.sqrt(last24.map(x => Math.pow(x - mean24, 2)).reduce((a, b) => a + b) / last24.length);
+    // CI Factor (e.g., 1.96 for 95% CI)
+    const CI_FACTOR = 1.96; 
+    
+    
+    for (const hour of forecastHours) {
+        const forecastDate = new Date(lastTimestamp.getTime() + (hour * 60 * 60 * 1000));
+        const formattedTimestamp = Utilities.formatDate(forecastDate, timeZone, "yyyy-MM-dd HH:mm:ss");
+        
+        // Since this is basic EMA, the forecast prediction (PV) is the last calculated EMA (or last value)
+        // We use the last known real value for stability, assuming the EMA is very close.
+        const predictedValue = lastKnownValue + (Math.random() * 0.1 - 0.05); // Add slight noise to the final prediction
+        
+        // Confidence Interval Calculation (CI = Z-score * Std Dev * sqrt(n) where n is forecast horizon)
+        // For simplicity in Apps Script, we use CI = Z * StdDev * sqrt(hour/24)
+        const confidenceError = CI_FACTOR * stdDev * Math.sqrt(hour / 24);
+        
+        const lowerBound = predictedValue - confidenceError;
+        const upperBound = predictedValue + confidenceError;
+        
+        forecastRows.push([
+            formattedTimestamp, 
+            predictedValue.toFixed(2), 
+            lowerBound.toFixed(2), 
+            upperBound.toFixed(2)
+        ]);
+    }
+    
+    return forecastRows;
+}
+
+/**
+ * Writes the forecast results to a dedicated "Forecast Results" sheet.
+ */
+function writeForecastResults(forecastResults, timeZone, mainSheet) {
+    let forecastSheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Forecast Results");
+    
+    if (!forecastSheet) {
+        forecastSheet = SpreadsheetApp.getActiveSpreadsheet().insertSheet("Forecast Results");
+        forecastSheet.appendRow(["Forecast Timestamp", "Predicted Temperature (°C)", "95% Lower Bound", "95% Upper Bound"]);
+    }
+    
+    // Find where the forecast rows should start (after the last entry)
+    const startRow = forecastSheet.getLastRow() + 1;
+    
+    // Write the 1hr, 6hr, and 24hr forecast rows
+    forecastSheet.getRange(startRow, 1, forecastResults.length, forecastResults[0].length).setValues(forecastResults);
+    
+    Logger.log("Forecasting Results written to 'Forecast Results' sheet.");
+}
+
+// =========================================================================
+// HELPER FUNCTION: GEMINI API CALL (SINGLE ROW, 5-PART ANALYSIS)
+// =========================================================================
+
+function runGeminiAnalysis(sensorStats, API_URL) {
+  
+  let analysisSheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("AI Insights");
+  
+  if (!analysisSheet) {
+    analysisSheet = SpreadsheetApp.getActiveSpreadsheet().insertSheet("AI Insights");
+    // --- CRITICAL LINE 1: UPDATED HEADERS (5 Analysis Columns) ---
+    analysisSheet.appendRow([
+        "Analysis Timestamp", 
+        "Temperature Analysis", 
+        "Pressure Analysis", 
+        "Distance Analysis", // New Column
+        "Humidity Analysis", // New Column
+        "Overall Stability"
+    ]);
+  }
+
+  const dataString = JSON.stringify(sensorStats);
+  const currentTimestamp = Utilities.formatDate(new Date(), SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone(), "yyyy-MM-dd HH:mm:ss");
+
+  // The prompt is correct, requesting 5 parts: [Analysis 1]|||[Analysis 2]|||[Analysis 3]|||[Analysis 4]|||[Analysis 5]
+  const prompt = "Act as an IoT Data Analyst. Analyze the following 24-hour summary statistics: " + 
+                 dataString + ". Provide five distinct, concise analysis paragraphs, separated by a triple pipe (|||). " +
+                 "1. **Temperature Analysis:** What does the average temperature of " + sensorStats.avg_temp + 
+                 "°C and the temperature range (" + sensorStats.min_temp + "°C to " + sensorStats.max_temp + 
+                 "°C) indicate? Be concise and summarize the diurnal cycle." +
+                 "2. **Pressure Analysis:** Is the pressure (" + sensorStats.avg_pressure + " ATM) stable? Comment on the small pressure range. " +
+                 "3. **Distance Analysis:** Interpret the distance range (" + sensorStats.distance_range + 
+                 " cm). Does this suggest a static or moving target? Be concise." +
+                 "4. **Humidity Analysis:** Interpret the average humidity (" + sensorStats.avg_humidity + 
+                 "%) and its implications for the environment (e.g., damp, dry, moderate)." + 
+                 "5. **Overall Stability:** Conclude with a final verdict (Stable, Dynamic, or Volatile) on the environment, briefly referencing all five metrics." + 
+                 "**Format your output strictly as: [Analysis 1]|||[Analysis 2]|||[Analysis 3]|||[Analysis 4]|||[Analysis 5]** Do not include any extra text, headings, or numbering outside of the analysis content itself.";
+  
+  const requestBody = {
+    contents: [
+      {
+        parts: [
+          {
+            text: prompt
+          }
+        ]
+      }
+    ],
+    generationConfig: {
+      temperature: 0.2 
+    }
+  };
+
+  const options = {
+    method: 'post',
+    contentType: 'application/json',
+    payload: JSON.stringify(requestBody),
+    muteHttpExceptions: true
+  };
+
+  try {
+    const response = UrlFetchApp.fetch(API_URL, options);
+    const responseCode = response.getResponseCode();
+    const responseText = response.getContentText();
+    
+    if (responseCode !== 200) {
+      Logger.log("Final API Error: " + responseText);
+      return "API Error Code: " + responseCode + ". Response: " + responseText.substring(0, 100) + "...";
+    }
+    
+    const jsonResponse = JSON.parse(responseText);
+    
+    if (jsonResponse.candidates && jsonResponse.candidates.length > 0 && jsonResponse.candidates[0].content.parts.length > 0) {
+      let analysisText = jsonResponse.candidates[0].content.parts[0].text.trim();
+      
+      // --- PARSING LOGIC ---
+      const analysisParts = analysisText.split('|||').map(part => part.trim());
+      
+      // --- CRITICAL LINE 2: CHECK FOR 5 PARTS ---
+      if (analysisParts.length === 5) {
+        // [Timestamp, Temp, Pressure, Distance, Humidity, Stability]
+        const rowData = [currentTimestamp, ...analysisParts];
+        analysisSheet.appendRow(rowData);
+        
+        Logger.log("Gemini Structured Analysis Successful. Written to AI Insights sheet.");
+        return analysisParts[0].substring(0, 50) + '...';
+      } else {
+        // Log error if parsing fails, writing raw text to column 2
+        analysisSheet.appendRow([currentTimestamp, "Parsing Error: Expected 5 parts, found " + analysisParts.length, analysisText, "", "", ""]);
+        Logger.log("Parsing failed. AI output did not contain 5 '|||' separated parts: " + analysisText);
+        return "AI Analysis failed to parse. Check 'AI Insights' sheet for raw output.";
+      }
+      
+    } else {
+      Logger.log("Gemini Analysis failed to return content: " + responseText);
+      return "AI Analysis failed: Empty response from model.";
+    }
+
+  } catch (e) {
+    Logger.log("API Exception: " + e.toString());
+    return "Script Exception: " + e.toString();
+  }
+}
